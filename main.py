@@ -1,253 +1,150 @@
+from functools import lru_cache
 import os
+import re
 import sqlite3
-import numpy as np
-import pandas as pd
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
-import re
-from functools import lru_cache
+import numpy as np
+import pandas as pd
 
-# 1. 엑셀 파일 및 DB 파일 경로 자동 탐색
-possible_db_paths = ["apt_data.db", "apt_data_master.db", "/content/apt_data_local_fast.db"]
-DB_FILE = "apt_data.db"
-for p in possible_db_paths:
-    if os.path.exists(p):
-        DB_FILE = p
-        break
+# 1. 사용할 전국 통합 SQLite DB 파일 경로 지정
+DB_FILE = "apt_data_master.db"
 
-possible_excel_paths = [
-    (".", "20260911_단지_기본정보.xlsx", "20260911_단지_면적정보.xlsx")
-]
 
-basic_path, area_path = None, None
-for folder, b_name, a_name in possible_excel_paths:
-    bp = os.path.join(folder, b_name)
-    ap = os.path.join(folder, a_name)
-    if os.path.exists(bp) and os.path.exists(ap):
-        basic_path, area_path = bp, ap
-        break
-
-# 2. 서버 구동 시 K-apt 엑셀 메타데이터가 DB에 없거나 갱신 필요시 자동 반영
-if basic_path and area_path and os.path.exists(DB_FILE):
-    try:
-        df_basic = pd.read_excel(basic_path, header=1)
-        df_area = pd.read_excel(area_path, header=1)
-
-        df_basic_daegu = df_basic[df_basic['시도'] == '대구광역시'].copy()
-        df_area_daegu = df_area[df_area['시도'] == '대구광역시'].copy()
-
-        def normalize_name(name):
-            if not name: return ""
-            n = re.sub(r'\(.*?\)', '', str(name))
-            n = n.replace('아파트', '').replace('단지', '').strip()
-            return re.sub(r'\s+', '', n)
-
-        df_basic_daegu['norm_name'] = df_basic_daegu['단지명'].apply(normalize_name)
-        units_total_dict = df_basic_daegu.set_index('단지코드')['세대수'].to_dict()
-
-        mask_84 = (df_area_daegu['주거전용면적(세부)'] >= 83.0) & (df_area_daegu['주거전용면적(세부)'] <= 85.99)
-        units_84_dict = df_area_daegu[mask_84].groupby('단지코드')['세대수'].sum().to_dict()
-
-        mask_59 = (df_area_daegu['주거전용면적(세부)'] >= 58.0) & (df_area_daegu['주거전용면적(세부)'] <= 60.99)
-        units_59_dict = df_area_daegu[mask_59].groupby('단지코드')['세대수'].sum().to_dict()
-
-        def summarize_types(group):
-            parts = []
-            for _, row in group.iterrows():
-                area = row['주거전용면적(세부)']
-                cnt = row['세대수']
-                if pd.notnull(area) and pd.notnull(cnt):
-                    parts.append(f"{int(round(float(area)))}㎡({int(cnt)}세대)")
-            return " / ".join(parts)
-
-        type_info_df = df_area_daegu.groupby('단지코드', group_keys=False).apply(summarize_types).reset_index(name='type_info_kapt')
-        merged_meta = pd.merge(df_basic_daegu, type_info_df, on='단지코드', how='left')
-
-        def format_built_str(val):
-            if pd.isnull(val): return "-"
-            s = str(int(val))
-            if len(s) == 8:
-                y, m = s[:4], s[4:6]
-                try:
-                    age = 2026 - int(y) + 1
-                    return f"{y}.{m} ({age}년차)"
-                except:
-                    return f"{y}.{m}"
-            return str(val)
-
-        merged_meta['built_str_kapt'] = merged_meta['사용승인일'].apply(format_built_str)
-
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS apt_meta_master (
-                apt_name TEXT PRIMARY KEY,
-                norm_name TEXT,
-                built_year INTEGER,
-                built_str TEXT,
-                units_str TEXT,
-                units_84_str TEXT,
-                units_59_str TEXT,
-                type_info TEXT
-            )
-        """)
-
-        for _, row in merged_meta.iterrows():
-            apt_name = str(row['단지명']).strip()
-            norm_name = row['norm_name']
-            code = row['단지코드']
-            built_str = row['built_str_kapt']
-            
-            t_cnt = units_total_dict.get(code, row['세대수'])
-            units_str = f"{int(t_cnt):,}세대" if pd.notnull(t_cnt) and t_cnt > 0 else "-"
-            u84 = units_84_dict.get(code, 0)
-            units_84_str = f"{int(u84):,}세대" if u84 > 0 else "-"
-            u59 = units_59_dict.get(code, 0)
-            units_59_str = f"{int(u59):,}세대" if u59 > 0 else "-"
-            type_info = row['type_info_kapt'] if pd.notnull(row['type_info_kapt']) else "전용 정보 확인중"
-            
-            try: built_year = int(built_str[:4])
-            except: built_year = 2020
-
-            cur.execute("""
-                INSERT OR REPLACE INTO apt_meta_master (apt_name, norm_name, built_year, built_str, units_str, units_84_str, units_59_str, type_info)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (apt_name, norm_name, built_year, built_str, units_str, units_84_str, units_59_str, type_info))
-        conn.commit()
-
-        # 랭킹 캐시 빌드
-        cur.execute("DROP TABLE IF EXISTS apt_rank_yearly_summary;")
-        cur.execute("""
-            CREATE TABLE apt_rank_yearly_summary AS
-            WITH ranked_max AS (
-                SELECT 
-                    CAST(SUBSTR(deal_date, 1, 4) AS INTEGER) AS deal_year,
-                    apt_name,
-                    SUBSTR(lawd_cd, 1, 5) AS lawd_5,
-                    deal_date,
-                    deal_amount,
-                    exclu_use_ar,
-                    floor,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY CAST(SUBSTR(deal_date, 1, 4) AS INTEGER), apt_name, SUBSTR(lawd_cd, 1, 5)
-                        ORDER BY deal_amount DESC
-                    ) as rn
-                FROM apt_trades
-                WHERE deal_date >= '2010-01-01' AND apt_name IS NOT NULL AND apt_name != ''
-            ),
-            stats_summary AS (
-                SELECT 
-                    CAST(SUBSTR(deal_date, 1, 4) AS INTEGER) AS deal_year,
-                    apt_name,
-                    SUBSTR(lawd_cd, 1, 5) AS lawd_5,
-                    COUNT(*) AS total_trade_cnt,
-                    SUM(CASE WHEN exclu_use_ar >= 83.0 AND exclu_use_ar <= 85.99 THEN 1 ELSE 0 END) AS trade_cnt_84,
-                    SUM(CASE WHEN exclu_use_ar >= 58.0 AND exclu_use_ar <= 60.99 THEN 1 ELSE 0 END) AS trade_cnt_59,
-                    ROUND(MAX(deal_amount / 10000.0), 3) AS max_price,
-                    ROUND(AVG(deal_amount / 10000.0), 2) AS avg_price,
-                    ROUND(MAX(deal_amount / (exclu_use_ar / 3.30578)), 1) AS max_pyeong,
-                    ROUND(AVG(deal_amount / (exclu_use_ar / 3.30578)), 1) AS avg_pyeong,
-                    ROUND(MAX(CASE WHEN exclu_use_ar >= 83.0 AND exclu_use_ar <= 85.99 THEN deal_amount / 10000.0 END), 3) AS max_84_price,
-                    ROUND(AVG(CASE WHEN exclu_use_ar >= 83.0 AND exclu_use_ar <= 85.99 THEN deal_amount / 10000.0 END), 2) AS avg_84_price,
-                    ROUND(MAX(CASE WHEN exclu_use_ar >= 58.0 AND exclu_use_ar <= 60.99 THEN deal_amount / 10000.0 END), 3) AS max_59_price,
-                    ROUND(AVG(CASE WHEN exclu_use_ar >= 58.0 AND exclu_use_ar <= 60.99 THEN deal_amount / 10000.0 END), 2) AS avg_59_price,
-                    AVG(deal_amount / (exclu_use_ar / 3.30578)) as mean_pyeong,
-                    AVG((deal_amount / (exclu_use_ar / 3.30578)) * (deal_amount / (exclu_use_ar / 3.30578))) as mean_sq_pyeong
-                FROM apt_trades
-                WHERE deal_date >= '2010-01-01' AND apt_name IS NOT NULL AND apt_name != ''
-                GROUP BY CAST(SUBSTR(deal_date, 1, 4) AS INTEGER), apt_name, SUBSTR(lawd_cd, 1, 5)
-            )
-            SELECT 
-                s.deal_year, s.apt_name, s.lawd_5,
-                s.total_trade_cnt, s.trade_cnt_84, s.trade_cnt_59,
-                s.max_price, s.avg_price, s.max_pyeong, s.avg_pyeong,
-                s.max_84_price, s.avg_84_price, s.max_59_price, s.avg_59_price,
-                r.deal_date AS max_p_date,
-                ROUND(r.exclu_use_ar, 1) AS max_p_area,
-                ROUND((r.exclu_use_ar / 3.30578) * 1.3, 1) AS max_p_pyeong_est,
-                COALESCE(r.floor, '-') AS max_p_floor,
-                CASE 
-                    WHEN s.total_trade_cnt >= 2 AND s.mean_pyeong > 0 AND (s.mean_sq_pyeong - (s.mean_pyeong * s.mean_pyeong)) > 0
-                    THEN ROUND((SQRT(s.mean_sq_pyeong - (s.mean_pyeong * s.mean_pyeong)) / s.mean_pyeong) * 100.0, 1)
-                    ELSE 0.0
-                END AS dispersion_cv
-            FROM stats_summary s
-            LEFT JOIN ranked_max r
-              ON s.deal_year = r.deal_year AND s.apt_name = r.apt_name AND s.lawd_5 = r.lawd_5 AND r.rn = 1;
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_rank_summary ON apt_rank_yearly_summary(deal_year, lawd_5);")
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("Meta build notice:", e)
-
-conn_init = sqlite3.connect(DB_FILE)
+# 2. 단지명 캐시 로딩 (검색 자동완성용)
 def clean_apt_name(raw_name):
-    if not raw_name: return ""
-    return re.sub(r'\[.*?\]', '', raw_name).strip()
+  if not raw_name:
+    return ""
+  return re.sub(r"\[.*?\]", "", raw_name).strip()
+
 
 def load_all_apt_names():
-    c = conn_init.cursor()
-    c.execute("SELECT DISTINCT apt_name FROM apt_trades ORDER BY apt_name ASC")
-    rows = c.fetchall()
-    names = []
-    for r in rows:
-        n = clean_apt_name(str(r[0]))
-        if n and not re.match(r'^[\d\-\(\)]+$', n) and n not in names:
-            names.append(n)
-    return names
+  if not os.path.exists(DB_FILE):
+    return []
+  conn = sqlite3.connect(DB_FILE)
+  c = conn.cursor()
+  c.execute("SELECT DISTINCT apt_name FROM apt_trades ORDER BY apt_name ASC")
+  rows = c.fetchall()
+  names = []
+  for r in rows:
+    n = clean_apt_name(str(r[0]))
+    if n and not re.match(r"^[\d\-\(\)]+$", n) and n not in names:
+      names.append(n)
+  conn.close()
+  return names
+
 
 CACHED_APT_NAMES = load_all_apt_names()
-conn_init.close()
 
 APT_COMPARE_RANKINGS = {
-    "청라힐스자이": ["남산자이하늘채", "남산롯데캐슬센트럴스카이", "더샵디어엘로", "대신센트럴자이", "힐스테이트대구역", "수성범어W"],
-    "더샵디어엘로": ["동대구역화성파크드림", "청라힐스자이", "동대구더샵센트럴시티", "이안센트럴D", "신천센트럴자이", "힐스테이트대구역", "남산자이하늘채"],
-    "수성범어W": ["힐스테이트범어", "두산위브더제니스(대구 수성)", "e편한세상범어", "범어SKVIEW", "더샵디어엘로", "남산자이하늘채"],
-    "힐스테이트대구역": ["대구역오페라W", "힐스테이트도원센트럴", "대구역유림노르웨이숲", "청라힐스자이", "더샵디어엘로", "남산자이하늘채"]
+    "청라힐스자이": [
+        "남산자이하늘채",
+        "남산롯데캐슬센트럴스카이",
+        "더샵디어엘로",
+        "대신센트럴자이",
+        "힐스테이트대구역",
+        "수성범어W",
+    ],
+    "더샵디어엘로": [
+        "동대구역화성파크드림",
+        "청라힐스자이",
+        "동대구더샵센트럴시티",
+        "이안센트럴D",
+        "신천센트럴자이",
+        "힐스테이트대구역",
+        "남산자이하늘채",
+    ],
+    "수성범어W": [
+        "힐스테이트범어",
+        "두산위브더제니스(대구 수성)",
+        "e편한세상범어",
+        "범어SKVIEW",
+        "더샵디어엘로",
+        "남산자이하늘채",
+    ],
+    "힐스테이트대구역": [
+        "대구역오페라W",
+        "힐스테이트도원센트럴",
+        "대구역유림노르웨이숲",
+        "청라힐스자이",
+        "더샵디어엘로",
+        "남산자이하늘채",
+    ],
 }
-DEFAULT_RANK = ["수성범어W", "두산위브더제니스(대구 수성)", "더샵디어엘로", "청라힐스자이", "힐스테이트대구역", "남산자이하늘채"]
+DEFAULT_RANK = [
+    "수성범어W",
+    "두산위브더제니스(대구 수성)",
+    "더샵디어엘로",
+    "청라힐스자이",
+    "힐스테이트대구역",
+    "남산자이하늘채",
+]
 
 LAWD_CD_MAP = {
-    "대구전체": ["27110", "27140", "27170", "27200", "27230", "27260", "27290", "27710"],
-    "중구": ["27110"], "동구": ["27140"], "서구": ["27170"], "남구": ["27200"],
-    "북구": ["27230"], "수성구": ["27260"], "달서구": ["27290"], "달성군": ["27710"]
+    "대구전체": [
+        "27110",
+        "27140",
+        "27170",
+        "27200",
+        "27230",
+        "27260",
+        "27290",
+        "27710",
+    ],
+    "중구": ["27110"],
+    "동구": ["27140"],
+    "서구": ["27170"],
+    "남구": ["27200"],
+    "북구": ["27230"],
+    "수성구": ["27260"],
+    "달서구": ["27290"],
+    "달성군": ["27710"],
 }
 
 app = FastAPI()
 
+
 @app.get("/api/search-apt")
 def search_apt(q: str = Query("")):
-    query_str = q.strip().lower()
-    if not query_str: return CACHED_APT_NAMES[:20]
-    q_compact = query_str.replace(" ", "")
-    keywords = query_str.split()
-    matched = []
-    for name in CACHED_APT_NAMES:
-        name_lower = name.lower()
-        if q_compact in name_lower.replace(" ", "") or all(k in name_lower for k in keywords):
-            matched.append(name)
-            if len(matched) >= 20: break
-    return matched
+  query_str = q.strip().lower()
+  if not query_str:
+    return CACHED_APT_NAMES[:20]
+  q_compact = query_str.replace(" ", "")
+  keywords = query_str.split()
+  matched = []
+  for name in CACHED_APT_NAMES:
+    name_lower = name.lower()
+    if q_compact in name_lower.replace(" ", "") or all(
+        k in name_lower for k in keywords
+    ):
+      matched.append(name)
+      if len(matched) >= 20:
+        break
+  return matched
+
 
 @lru_cache(maxsize=128)
 def query_chart_from_db(pure_name: str, months: int, area_type: str):
-    conn = sqlite3.connect(DB_FILE)
-    max_date_row = conn.execute("SELECT MAX(deal_date) FROM apt_trades").fetchone()
-    if not max_date_row or not max_date_row[0]:
-        conn.close()
-        return None, None, []
+  conn = sqlite3.connect(DB_FILE)
+  max_date_row = conn.execute(
+      "SELECT MAX(deal_date) FROM apt_trades"
+  ).fetchone()
+  if not max_date_row or not max_date_row[0]:
+    conn.close()
+    return None, None, []
 
-    end_date = pd.to_datetime(max_date_row[0])
-    start_date = end_date - pd.DateOffset(months=months)
-    start_str = start_date.strftime("%Y-%m-%d")
+  end_date = pd.to_datetime(max_date_row[0])
+  start_date = end_date - pd.DateOffset(months=months)
+  start_str = start_date.strftime("%Y-%m-%d")
 
-    area_cond = ""
-    params = [pure_name, pure_name, start_str]
-    if area_type == "84": area_cond = "AND exclu_use_ar >= 83.0 AND exclu_use_ar <= 85.99"
-    elif area_type == "59": area_cond = "AND exclu_use_ar >= 58.0 AND exclu_use_ar <= 60.99"
+  area_cond = ""
+  params = [pure_name, pure_name, start_str]
+  if area_type == "84":
+    area_cond = "AND exclu_use_ar >= 83.0 AND exclu_use_ar <= 85.99"
+  elif area_type == "59":
+    area_cond = "AND exclu_use_ar >= 58.0 AND exclu_use_ar <= 60.99"
 
-    query = f"""
+  query = f"""
         SELECT deal_date, deal_amount, exclu_use_ar, floor
         FROM apt_trades
         WHERE (apt_name = ? OR REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', ''))
@@ -255,140 +152,211 @@ def query_chart_from_db(pure_name: str, months: int, area_type: str):
           {area_cond}
         ORDER BY deal_date ASC
     """
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return start_str, max_date_row[0], df.to_dict('records')
+  df = pd.read_sql_query(query, conn, params=params)
+  conn.close()
+  return start_str, max_date_row[0], df.to_dict("records")
+
 
 @app.get("/api/chart-data")
-def get_chart_data(apt_name: str = Query(...), months: int = Query(12), area_type: str = Query("84")):
-    pure_name = clean_apt_name(apt_name)
-    start_str, max_date, raw_records = query_chart_from_db(pure_name, months, area_type)
-    
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT built_year, built_str, units_str, type_info FROM apt_meta_master WHERE REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')", (pure_name,))
-    meta_row = cur.fetchone()
-    
-    if meta_row and "집계중" not in meta_row[2] and "확인중" not in meta_row[2]:
-        byear, bstr, ustr, tinfo = meta_row
-    else:
-        cur.execute("SELECT MIN(deal_date) FROM apt_trades WHERE apt_name = ? OR REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')", (pure_name, pure_name))
-        min_date_row = cur.fetchone()
-        min_date = min_date_row[0] if min_date_row else None
-        byear = int(min_date[:4]) if min_date else 2020
-        age = 2026 - byear + 1
-        bstr = f"{byear}년 ({age}년차)"
-        ustr = "단지 세대수 집계중"
-        cur.execute("SELECT ROUND(exclu_use_ar), COUNT(*) FROM apt_trades WHERE (apt_name = ? OR REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')) GROUP BY ROUND(exclu_use_ar) ORDER BY COUNT(*) DESC LIMIT 4", (pure_name, pure_name))
-        areas = cur.fetchall()
-        tinfo = " / ".join([f"{int(a[0])}㎡({a[1]}건)" for a in areas]) if areas else "전용 정보 확인중"
-    conn.close()
+def get_chart_data(
+    apt_name: str = Query(...),
+    months: int = Query(12),
+    area_type: str = Query("84"),
+):
+  pure_name = clean_apt_name(apt_name)
+  start_str, max_date, raw_records = query_chart_from_db(
+      pure_name, months, area_type
+  )
 
-    top10_list = APT_COMPARE_RANKINGS.get(pure_name, DEFAULT_RANK)
+  conn = sqlite3.connect(DB_FILE)
+  cur = conn.cursor()
+  cur.execute(
+      "SELECT built_year, built_str, units_str, type_info FROM apt_meta_master"
+      " WHERE REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')",
+      (pure_name,),
+  )
+  meta_row = cur.fetchone()
 
-    if not raw_records:
-        return {
-            "result": "empty", "dates": [], "prices": [], "ma": [], "upper": [], "lower": [], "details": [],
-            "start_date": start_str, "built_date": f"{byear}-01-01",
-            "stats": {
-                "built": bstr, "units": ustr, "type_info": tinfo, "trade_count": 0,
-                "max_price": "-", "max_info": "기간 내 거래 없음", "avg_price": "-", "latest_ma": "-", "dispersion": "-"
-            },
-            "top10": top10_list, "pure_name": pure_name
-        }
+  if meta_row and "집계중" not in meta_row[2] and "확인중" not in meta_row[2]:
+    byear, bstr, ustr, tinfo = meta_row
+  else:
+    cur.execute(
+        "SELECT MIN(deal_date) FROM apt_trades WHERE apt_name = ? OR"
+        " REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')",
+        (pure_name, pure_name),
+    )
+    min_date_row = cur.fetchone()
+    min_date = min_date_row[0] if min_date_row else None
+    byear = int(min_date[:4]) if min_date else 2020
+    age = 2026 - byear + 1
+    bstr = f"{byear}년 ({age}년차)"
+    ustr = "단지 세대수 집계중"
+    cur.execute(
+        "SELECT ROUND(exclu_use_ar), COUNT(*) FROM apt_trades WHERE (apt_name ="
+        " ? OR REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')) GROUP BY"
+        " ROUND(exclu_use_ar) ORDER BY COUNT(*) DESC LIMIT 4",
+        (pure_name, pure_name),
+    )
+    areas = cur.fetchall()
+    tinfo = (
+        " / ".join([f"{int(a[0])}㎡({a[1]}건)" for a in areas])
+        if areas
+        else "전용 정보 확인중"
+    )
+  conn.close()
 
-    df = pd.DataFrame(raw_records)
-    if area_type == "all":
-        df['price'] = (df['deal_amount'] / (df['exclu_use_ar'] / 3.30578)).round(1)
-        unit_suffix = "만원/평"
-    else:
-        df['price'] = (df['deal_amount'] / 10000.0).round(3)
-        unit_suffix = "억"
+  top10_list = APT_COMPARE_RANKINGS.get(pure_name, DEFAULT_RANK)
 
-    mean_val = df['price'].mean()
-    std_val = df['price'].std()
-    if pd.notnull(mean_val) and mean_val > 0 and pd.notnull(std_val):
-        cv = (std_val / mean_val) * 100.0
-        if cv <= 3.5: disp_badge = f"{round(cv, 1)}% (매우 안정)"
-        elif cv <= 6.5: disp_badge = f"{round(cv, 1)}% (안정)"
-        elif cv <= 10.0: disp_badge = f"{round(cv, 1)}% (보통)"
-        else: disp_badge = f"{round(cv, 1)}% (편차 큼)"
-    else:
-        disp_badge = "-"
-
-    prices = df['price'].tolist()
-    ma_list, upper_list, lower_list = [], [], []
-    for i in range(len(prices)):
-        window = prices[max(0, i - 19): i + 1]
-        m = float(np.mean(window))
-        s = float(np.std(window))
-        ma_list.append(round(m, 2))
-        upper_list.append(round(m + (s * 2), 2))
-        lower_list.append(round(m - (s * 2), 2))
-
-    details = [{"excluUseAr": round(float(r['exclu_use_ar']), 2), "floor": int(r['floor']) if pd.notnull(r['floor']) else "-"} for _, r in df.iterrows()]
-    max_idx = df['price'].idxmax()
-    max_row = df.loc[max_idx]
-
-    stats = {
-        "built": bstr, "units": ustr, "type_info": tinfo, "trade_count": len(df),
-        "max_price": f"{max_row['price']}{unit_suffix}",
-        "max_info": f"계약일: {max_row['deal_date']} / {int(max_row['floor']) if pd.notnull(max_row['floor']) else '-'}층 ({round(float(max_row['exclu_use_ar']),1)}㎡)",
-        "avg_price": f"{round(mean_val, 2)}{unit_suffix}",
-        "latest_ma": f"{ma_list[-1]}{unit_suffix}" if ma_list else "-",
-        "dispersion": disp_badge
-    }
-
+  if not raw_records:
     return {
-        "result": "ok", "dates": df['deal_date'].tolist(), "prices": prices, "ma": ma_list,
-        "upper": upper_list, "lower": lower_list, "start_date": start_str, "built_date": f"{byear}-01-01",
-        "details": details, "stats": stats, "top10": top10_list, "pure_name": pure_name
+        "result": "empty",
+        "dates": [],
+        "prices": [],
+        "ma": [],
+        "upper": [],
+        "lower": [],
+        "details": [],
+        "start_date": start_str,
+        "built_date": f"{byear}-01-01",
+        "stats": {
+            "built": bstr,
+            "units": ustr,
+            "type_info": tinfo,
+            "trade_count": 0,
+            "max_price": "-",
+            "max_info": "기간 내 거래 없음",
+            "avg_price": "-",
+            "latest_ma": "-",
+            "dispersion": "-",
+        },
+        "top10": top10_list,
+        "pure_name": pure_name,
     }
+
+  df = pd.DataFrame(raw_records)
+  if area_type == "all":
+    df["price"] = (df["deal_amount"] / (df["exclu_use_ar"] / 3.30578)).round(1)
+    unit_suffix = "만원/평"
+  else:
+    df["price"] = (df["deal_amount"] / 10000.0).round(3)
+    unit_suffix = "억"
+
+  mean_val = df["price"].mean()
+  std_val = df["price"].std()
+  if pd.notnull(mean_val) and mean_val > 0 and pd.notnull(std_val):
+    cv = (std_val / mean_val) * 100.0
+    if cv <= 3.5:
+      disp_badge = f"{round(cv, 1)}% (매우 안정)"
+    elif cv <= 6.5:
+      disp_badge = f"{round(cv, 1)}% (안정)"
+    elif cv <= 10.0:
+      disp_badge = f"{round(cv, 1)}% (보통)"
+    else:
+      disp_badge = f"{round(cv, 1)}% (편차 큼)"
+  else:
+    disp_badge = "-"
+
+  prices = df["price"].tolist()
+  ma_list, upper_list, lower_list = [], [], []
+  for i in range(len(prices)):
+    window = prices[max(0, i - 19) : i + 1]
+    m = float(np.mean(window))
+    s = float(np.std(window))
+    ma_list.append(round(m, 2))
+    upper_list.append(round(m + (s * 2), 2))
+    lower_list.append(round(m - (s * 2), 2))
+
+  details = [
+      {
+          "excluUseAr": round(float(r["exclu_use_ar"]), 2),
+          "floor": int(r["floor"]) if pd.notnull(r["floor"]) else "-",
+      }
+      for _, r in df.iterrows()
+  ]
+  max_idx = df["price"].idxmax()
+  max_row = df.loc[max_idx]
+
+  stats = {
+      "built": bstr,
+      "units": ustr,
+      "type_info": tinfo,
+      "trade_count": len(df),
+      "max_price": f"{max_row['price']}{unit_suffix}",
+      "max_info": (
+          f"계약일: {max_row['deal_date']} /"
+          f" {int(max_row['floor']) if pd.notnull(max_row['floor']) else '-'}층"
+          f" ({round(float(max_row['exclu_use_ar']),1)}㎡)"
+      ),
+      "avg_price": f"{round(mean_val, 2)}{unit_suffix}",
+      "latest_ma": f"{ma_list[-1]}{unit_suffix}" if ma_list else "-",
+      "dispersion": disp_badge,
+  }
+
+  return {
+      "result": "ok",
+      "dates": df["deal_date"].tolist(),
+      "prices": prices,
+      "ma": ma_list,
+      "upper": upper_list,
+      "lower": lower_list,
+      "start_date": start_str,
+      "built_date": f"{byear}-01-01",
+      "details": details,
+      "stats": stats,
+      "top10": top10_list,
+      "pure_name": pure_name,
+  }
+
 
 @app.get("/api/rankings")
-def get_rankings(year: int = Query(2026), rank_type: str = Query("price_max"), regions: str = Query("대구전체")):
-    conn = sqlite3.connect(DB_FILE)
-    lawd_codes = []
-    if "대구전체" in regions:
-        lawd_codes = LAWD_CD_MAP["대구전체"]
-    else:
-        for r in regions.split(","):
-            r_clean = r.strip()
-            if r_clean in LAWD_CD_MAP: lawd_codes.extend(LAWD_CD_MAP[r_clean])
-    lawd_codes = list(set(lawd_codes)) if lawd_codes else LAWD_CD_MAP["대구전체"]
+def get_rankings(
+    year: int = Query(2026),
+    rank_type: str = Query("price_max"),
+    regions: str = Query("대구전체"),
+):
+  conn = sqlite3.connect(DB_FILE)
+  lawd_codes = []
+  if "대구전체" in regions:
+    lawd_codes = LAWD_CD_MAP["대구전체"]
+  else:
+    for r in regions.split(","):
+      r_clean = r.strip()
+      if r_clean in LAWD_CD_MAP:
+        lawd_codes.extend(LAWD_CD_MAP[r_clean])
+  lawd_codes = list(set(lawd_codes)) if lawd_codes else LAWD_CD_MAP["대구전체"]
 
-    placeholders = ",".join(["?"] * len(lawd_codes))
-    where_extra = ""
-    
-    if rank_type == "price_max":
-        order_col, metric_name = "COALESCE(s.max_price, 0) DESC", "단지 최고가"
-    elif rank_type == "84_max":
-        where_extra = "AND s.max_84_price > 0"
-        order_col, metric_name = "s.max_84_price DESC", "국평(84) 최고가"
-    elif rank_type == "84_avg":
-        where_extra = "AND s.avg_84_price > 0"
-        order_col, metric_name = "s.avg_84_price DESC", "국평(84) 평균가"
-    elif rank_type == "59_max":
-        where_extra = "AND s.max_59_price > 0"
-        order_col, metric_name = "s.max_59_price DESC", "전용 59 최고가"
-    elif rank_type == "59_avg":
-        where_extra = "AND s.avg_59_price > 0"
-        order_col, metric_name = "s.avg_59_price DESC", "전용 59 평균가"
-    elif rank_type == "trade_cnt":
-        order_col, metric_name = "s.total_trade_cnt DESC", "연간 거래량"
-    elif rank_type == "pyeong_avg":
-        order_col, metric_name = "COALESCE(s.avg_pyeong, 0) DESC", "평균 평당가"
-    else:
-        order_col, metric_name = "COALESCE(s.max_price, 0) DESC", "단지 최고가"
+  placeholders = ",".join(["?"] * len(lawd_codes))
+  where_extra = ""
 
-    if "84" in rank_type:
-        units_select = "COALESCE(m.units_84_str, '-')"
-    elif "59" in rank_type:
-        units_select = "COALESCE(m.units_59_str, '-')"
-    else:
-        units_select = "COALESCE(m.units_str, '-')"
+  if rank_type == "price_max":
+    order_col, metric_name = "COALESCE(s.max_price, 0) DESC", "단지 최고가"
+  elif rank_type == "84_max":
+    where_extra = "AND s.max_84_price > 0"
+    order_col, metric_name = "s.max_84_price DESC", "국평(84) 최고가"
+  elif rank_type == "84_avg":
+    where_extra = "AND s.avg_84_price > 0"
+    order_col, metric_name = "s.avg_84_price DESC", "국평(84) 평균가"
+  elif rank_type == "59_max":
+    where_extra = "AND s.max_59_price > 0"
+    order_col, metric_name = "s.max_59_price DESC", "전용 59 최고가"
+  elif rank_type == "59_avg":
+    where_extra = "AND s.avg_59_price > 0"
+    order_col, metric_name = "s.avg_59_price DESC", "전용 59 평균가"
+  elif rank_type == "trade_cnt":
+    order_col, metric_name = "s.total_trade_cnt DESC", "연간 거래량"
+  elif rank_type == "pyeong_avg":
+    order_col, metric_name = "COALESCE(s.avg_pyeong, 0) DESC", "평균 평당가"
+  else:
+    order_col, metric_name = "COALESCE(s.max_price, 0) DESC", "단지 최고가"
 
-    query = f"""
+  if "84" in rank_type:
+    units_select = "COALESCE(m.units_84_str, '-')"
+  elif "59" in rank_type:
+    units_select = "COALESCE(m.units_59_str, '-')"
+  else:
+    units_select = "COALESCE(m.units_str, '-')"
+
+  query = f"""
         SELECT 
             s.apt_name, s.lawd_5, 
             s.total_trade_cnt, s.trade_cnt_84, s.trade_cnt_59,
@@ -405,49 +373,83 @@ def get_rankings(year: int = Query(2026), rank_type: str = Query("price_max"), r
         WHERE s.deal_year = ? AND s.lawd_5 IN ({placeholders}) {where_extra}
         ORDER BY {order_col} LIMIT 50
     """
-    df = pd.read_sql_query(query, conn, params=[year] + lawd_codes)
-    conn.close()
+  df = pd.read_sql_query(query, conn, params=[year] + lawd_codes)
+  conn.close()
 
-    lawd_to_gu = {"27110":"중구", "27140":"동구", "27170":"서구", "27200":"남구", "27230":"북구", "27260":"수성구", "27290":"달서구", "27710":"달성군"}
-    results = []
+  lawd_to_gu = {
+      "27110": "중구",
+      "27140": "동구",
+      "27170": "서구",
+      "27200": "남구",
+      "27230": "북구",
+      "27260": "수성구",
+      "27290": "달서구",
+      "27710": "달성군",
+  }
+  results = []
 
-    for idx, r in df.iterrows():
-        gu = lawd_to_gu.get(str(r['lawd_5']), "대구")
-        
-        if "84" in rank_type: display_trade_cnt = int(r['trade_cnt_84'])
-        elif "59" in rank_type: display_trade_cnt = int(r['trade_cnt_59'])
-        else: display_trade_cnt = int(r['total_trade_cnt'])
+  for idx, r in df.iterrows():
+    gu = lawd_to_gu.get(str(r["lawd_5"]), "대구")
 
-        tooltip_info = ""
-        if rank_type == "price_max" and r['max_p_date']:
-            tooltip_info = f"계약일: {r['max_p_date']} | {r['max_price']}억 | 약 {r['max_p_pyeong_est']}평형(전용 {r['max_p_area']}㎡) | {r['max_p_floor']}층"
+    if "84" in rank_type:
+      display_trade_cnt = int(r["trade_cnt_84"])
+    elif "59" in rank_type:
+      display_trade_cnt = int(r["trade_cnt_59"])
+    else:
+      display_trade_cnt = int(r["total_trade_cnt"])
 
-        if rank_type == "price_max": metric_val = f"{r['max_price']} 억"
-        elif rank_type == "84_max": metric_val = f"{r['max_84_price']} 억"
-        elif rank_type == "84_avg": metric_val = f"{r['avg_84_price']} 억"
-        elif rank_type == "59_max": metric_val = f"{r['max_59_price']} 억"
-        elif rank_type == "59_avg": metric_val = f"{r['avg_59_price']} 억"
-        elif rank_type == "trade_cnt": metric_val = f"{int(r['total_trade_cnt']):,} 건"
-        elif rank_type == "pyeong_avg": metric_val = f"{r['avg_pyeong']:,.1f} 만원/평"
-        else: metric_val = f"{r['max_price']} 억"
+    tooltip_info = ""
+    if rank_type == "price_max" and r["max_p_date"]:
+      tooltip_info = (
+          f"계약일: {r['max_p_date']} | {r['max_price']}억 | 약"
+          f" {r['max_p_pyeong_est']}평형(전용 {r['max_p_area']}㎡) |"
+          f" {r['max_p_floor']}층"
+      )
 
-        cv_val = float(r['dispersion_cv'])
-        if cv_val <= 0 or r['total_trade_cnt'] < 2: disp_badge = "-"
-        elif cv_val <= 3.5: disp_badge = f"{cv_val:.1f}% (매우 안정)"
-        elif cv_val <= 6.5: disp_badge = f"{cv_val:.1f}% (안정)"
-        elif cv_val <= 10.0: disp_badge = f"{cv_val:.1f}% (보통)"
-        else: disp_badge = f"{cv_val:.1f}% (편차 큼)"
+    if rank_type == "price_max":
+      metric_val = f"{r['max_price']} 억"
+    elif rank_type == "84_max":
+      metric_val = f"{r['max_84_price']} 억"
+    elif rank_type == "84_avg":
+      metric_val = f"{r['avg_84_price']} 억"
+    elif rank_type == "59_max":
+      metric_val = f"{r['max_59_price']} 억"
+    elif rank_type == "59_avg":
+      metric_val = f"{r['avg_59_price']} 억"
+    elif rank_type == "trade_cnt":
+      metric_val = f"{int(r['total_trade_cnt']):,} 건"
+    elif rank_type == "pyeong_avg":
+      metric_val = f"{r['avg_pyeong']:,.1f} 만원/평"
+    else:
+      metric_val = f"{r['max_price']} 억"
 
-        results.append({
-            "rank": idx + 1, "apt_name": r['apt_name'], "region": f"대구 {gu}",
-            "metric_name": metric_name, "metric_val": metric_val,
-            "tooltip_info": tooltip_info,
-            "dispersion": disp_badge,
-            "trade_cnt": display_trade_cnt,
-            "built_str": r['built_str'], "units_str": r['units_str'],
-            "type_info": r['type_info']
-        })
-    return results
+    cv_val = float(r["dispersion_cv"])
+    if cv_val <= 0 or r["total_trade_cnt"] < 2:
+      disp_badge = "-"
+    elif cv_val <= 3.5:
+      disp_badge = f"{cv_val:.1f}% (매우 안정)"
+    elif cv_val <= 6.5:
+      disp_badge = f"{cv_val:.1f}% (안정)"
+    elif cv_val <= 10.0:
+      disp_badge = f"{cv_val:.1f}% (보통)"
+    else:
+      disp_badge = f"{cv_val:.1f}% (편차 큼)"
+
+    results.append({
+        "rank": idx + 1,
+        "apt_name": r["apt_name"],
+        "region": f"대구 {gu}",
+        "metric_name": metric_name,
+        "metric_val": metric_val,
+        "tooltip_info": tooltip_info,
+        "dispersion": disp_badge,
+        "trade_cnt": display_trade_cnt,
+        "built_str": r["built_str"],
+        "units_str": r["units_str"],
+        "type_info": r["type_info"],
+    })
+  return results
+
 
 UI_HTML = """
 <!DOCTYPE html>
@@ -1289,6 +1291,7 @@ UI_HTML = """
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return UI_HTML
+  return UI_HTML
