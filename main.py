@@ -138,7 +138,7 @@ def query_chart_from_db(pure_name: str, months: int, area_type: str):
   start_str = start_date.strftime("%Y-%m-%d")
 
   area_cond = ""
-  params = [pure_name, pure_name, start_str]
+  params = [pure_name, start_str]
   if area_type == "84":
     area_cond = "AND exclu_use_ar >= 83.0 AND exclu_use_ar <= 85.99"
   elif area_type == "59":
@@ -147,7 +147,7 @@ def query_chart_from_db(pure_name: str, months: int, area_type: str):
   query = f"""
         SELECT deal_date, deal_amount, exclu_use_ar, floor
         FROM apt_trades
-        WHERE (apt_name = ? OR REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', ''))
+        WHERE apt_name = ?
           AND deal_date >= ?
           {area_cond}
         ORDER BY deal_date ASC
@@ -172,7 +172,7 @@ def get_chart_data(
   cur = conn.cursor()
   cur.execute(
       "SELECT built_year, built_str, units_str, type_info FROM apt_meta_master"
-      " WHERE REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')",
+      " WHERE apt_name = ?",
       (pure_name,),
   )
   meta_row = cur.fetchone()
@@ -181,9 +181,8 @@ def get_chart_data(
     byear, bstr, ustr, tinfo = meta_row
   else:
     cur.execute(
-        "SELECT MIN(deal_date) FROM apt_trades WHERE apt_name = ? OR"
-        " REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')",
-        (pure_name, pure_name),
+        "SELECT MIN(deal_date) FROM apt_trades WHERE apt_name = ?",
+        (pure_name,),
     )
     min_date_row = cur.fetchone()
     min_date = min_date_row[0] if min_date_row else None
@@ -192,10 +191,9 @@ def get_chart_data(
     bstr = f"{byear}년 ({age}년차)"
     ustr = "단지 세대수 집계중"
     cur.execute(
-        "SELECT ROUND(exclu_use_ar), COUNT(*) FROM apt_trades WHERE (apt_name ="
-        " ? OR REPLACE(apt_name, ' ', '') = REPLACE(?, ' ', '')) GROUP BY"
-        " ROUND(exclu_use_ar) ORDER BY COUNT(*) DESC LIMIT 4",
-        (pure_name, pure_name),
+        "SELECT ROUND(exclu_use_ar), COUNT(*) FROM apt_trades WHERE apt_name ="
+        " ? GROUP BY ROUND(exclu_use_ar) ORDER BY COUNT(*) DESC LIMIT 4",
+        (pure_name,),
     )
     areas = cur.fetchall()
     tinfo = (
@@ -369,7 +367,7 @@ def get_rankings(
             {units_select} as units_str,
             COALESCE(m.type_info, '-') as type_info
         FROM apt_rank_yearly_summary s
-        LEFT JOIN apt_meta_master m ON REPLACE(REPLACE(REPLACE(s.apt_name, '아파트', ''), '단지', ''), ' ', '') = m.norm_name
+        LEFT JOIN apt_meta_master m ON s.apt_name = m.apt_name
         WHERE s.deal_year = ? AND s.lawd_5 IN ({placeholders}) {where_extra}
         ORDER BY {order_col} LIMIT 50
     """
@@ -1179,29 +1177,36 @@ UI_HTML = """
 
         try {
           const res = await fetch(`/api/chart-data?apt_name=${encodeURIComponent(aptName)}&months=${months}&area_type=${currentAreaMode}`);
+          if (!res.ok) continue;
           const data = await res.json();
-          slotResults.push({ cfg, aptName: data.pure_name || aptName, data });
-        } catch(err) {}
+          if (data && data.result === 'ok') {
+            slotResults.push({ cfg, aptName: data.pure_name || aptName, data });
+          }
+        } catch(err) {
+          console.error("단지 조회 에러:", err);
+        }
       }
 
       globalSlotResults = slotResults;
-      renderCompareTable(slotResults);
-      renderTop10Rankings(slotResults);
+      if (typeof renderCompareTable === 'function') renderCompareTable(slotResults);
+      if (typeof renderTop10Rankings === 'function') renderTop10Rankings(slotResults);
 
       let allDatesSet = new Set();
       slotResults.forEach(({ data }) => {
-        data?.dates?.forEach(d => allDatesSet.add(d));
+        if (data && Array.isArray(data.dates)) {
+          data.dates.forEach(d => allDatesSet.add(d));
+        }
       });
 
       const sortedDates = Array.from(allDatesSet).sort();
       const datasets = [];
 
       slotResults.forEach(({ cfg, aptName, data }) => {
-        if (!data || data.result !== 'ok' || !data.dates) return;
+        if (!data || data.result !== 'ok' || !Array.isArray(data.dates)) return;
         const priceMap = {}, maMap = {}, upperMap = {}, lowerMap = {}, detailMap = {};
         data.dates.forEach((d, idx) => {
           priceMap[d] = data.prices[idx]; maMap[d] = data.ma[idx];
-          upperMap[d] = data.upper[idx]; lowerMap[d] = data.lower[idx]; detailMap[d] = data.details[idx];
+          upperMap[d] = data.upper[idx]; lowerMap[d] = data.lower[idx]; detailMap[d] = data.details ? data.details[idx] : null;
         });
 
         const upperArr = [], lowerArr = [], maArr = [], scatterArr = [], detailsArr = [];
@@ -1220,12 +1225,17 @@ UI_HTML = """
         datasets.push({ label: `${aptName} 실거래`, typeCategory: 'scatter', type: 'scatter', data: scatterArr, backgroundColor: cfg.color, borderColor: 'transparent', pointRadius: 4.5, pointHoverRadius: 7, hidden: !visibilityFlags.scatter, details: detailsArr, pureName: aptName });
       });
 
+      if (!chart) {
+        initVsChart();
+      }
       if (chart) {
         chart.data.labels = sortedDates;
         chart.data.datasets = datasets;
         chart.resetZoom();
         chart.update();
       }
+    } catch (globalErr) {
+      console.error("차트 렌더링 중 오류:", globalErr);
     } finally {
       showLoading(false);
     }
@@ -1279,7 +1289,6 @@ UI_HTML = """
         }
       }
     });
-    fetchAndRender();
   }
 
   window.onload = () => {
